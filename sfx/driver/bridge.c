@@ -8,9 +8,11 @@
 #include <poll.h>
 #include <stdbool.h>
 #include <signal.h>
+#include <time.h>
 #include <sys/socket.h>
 #include <sys/select.h>
 #include <arpa/inet.h>
+#include <netinet/tcp.h>
 #include <netdb.h>
 #include <linux/mctp.h>
 #include "pldm.h"
@@ -56,13 +58,36 @@ static void setup_signals(void)
     sigaction(SIGTERM, &sa, NULL);
 }
 
+/*
+ * Peer link to the device-side forwarder (cxl_test_tool).
+ *
+ * UDP mode: one datagram == one MCTP frame (legacy, lossy over WAN).
+ * TCP mode: byte stream, every MCTP frame is prefixed with a 2-byte
+ *           big-endian length so frame boundaries survive TCP segmentation
+ *           and retransmission. The link auto-reconnects when it drops.
+ */
+#define TCP_FRAME_HDR_LEN   2
+#define TCP_RECONNECT_SEC   1
+#define TCP_CONNECT_TIMEOUT_MS 3000
+
 struct udp_config {
     bool enabled;
+    bool tcp;
+    bool connected;
     int sockfd;
     struct sockaddr_storage target_addr;
     socklen_t target_addrlen;
     uint16_t listen_port;
+    char target[256];                      /* host:port for TCP reconnect */
+    uint8_t rx_buf[TCP_FRAME_HDR_LEN + MAX_BUF];
+    size_t rx_len;
+    time_t next_connect;
 };
+
+static const char *peer_name(const struct udp_config *cfg)
+{
+    return cfg->tcp ? "TCP" : "UDP";
+}
 
 struct control_request {
     bool enabled;
@@ -73,7 +98,11 @@ struct control_request {
 
 static void print_usage(const char *prog)
 {
-    printf("Usage: %s [--udp host:port --listen-port port [--no-bridge] [--once] [--control ctrl-opc] [--control-data \"hex bytes\"]]\n", prog);
+    printf("Usage: %s [--udp host:port --listen-port port | --tcp host:port [--listen-port port]]\n"
+           "          [--no-bridge] [--once] [--control ctrl-opc] [--control-data \"hex bytes\"]\n"
+           "  --udp  legacy datagram link, one datagram per MCTP frame\n"
+           "  --tcp  reliable stream link, 2-byte length-prefixed MCTP frames, auto-reconnect\n",
+           prog);
 }
 
 static int parse_port(const char *s, uint16_t *port)
@@ -106,7 +135,87 @@ static int parse_udp_target(const char *arg, char *host, size_t host_len, uint16
     return parse_port(sep + 1, port);
 }
 
-static int udp_init(struct udp_config *cfg, const char *target, uint16_t listen_port)
+static int bind_local_port(int sockfd, int family, uint16_t listen_port)
+{
+    int one = 1;
+
+    if (listen_port == 0)
+        return 0;
+
+    setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+
+    if (family == AF_INET) {
+        struct sockaddr_in local = {0};
+        local.sin_family = AF_INET;
+        local.sin_addr.s_addr = htonl(INADDR_ANY);
+        local.sin_port = htons(listen_port);
+        return bind(sockfd, (struct sockaddr *)&local, sizeof(local));
+    }
+    if (family == AF_INET6) {
+        struct sockaddr_in6 local6 = {0};
+        local6.sin6_family = AF_INET6;
+        local6.sin6_addr = in6addr_any;
+        local6.sin6_port = htons(listen_port);
+        return bind(sockfd, (struct sockaddr *)&local6, sizeof(local6));
+    }
+    return 0;
+}
+
+/* Non-blocking connect with a bounded wait so an unreachable peer cannot
+ * stall the bridge for the kernel's full SYN retry budget. */
+static int connect_with_timeout(int sockfd, const struct sockaddr *addr,
+                                socklen_t addrlen, int timeout_ms)
+{
+    int flags = fcntl(sockfd, F_GETFL, 0);
+    int ret;
+
+    if (flags < 0)
+        return -1;
+    if (fcntl(sockfd, F_SETFL, flags | O_NONBLOCK) < 0)
+        return -1;
+
+    ret = connect(sockfd, addr, addrlen);
+    if (ret < 0 && errno == EINPROGRESS) {
+        struct pollfd pfd = { .fd = sockfd, .events = POLLOUT };
+        int soerr = 0;
+        socklen_t soerr_len = sizeof(soerr);
+
+        ret = poll(&pfd, 1, timeout_ms);
+        if (ret <= 0) {
+            if (ret == 0)
+                errno = ETIMEDOUT;
+            ret = -1;
+        } else if (getsockopt(sockfd, SOL_SOCKET, SO_ERROR, &soerr, &soerr_len) < 0) {
+            ret = -1;
+        } else if (soerr != 0) {
+            errno = soerr;
+            ret = -1;
+        } else {
+            ret = 0;
+        }
+    }
+
+    if (fcntl(sockfd, F_SETFL, flags) < 0)
+        return -1;
+    return ret;
+}
+
+static void peer_disconnect(struct udp_config *cfg, const char *why)
+{
+    if (cfg->sockfd >= 0) {
+        close(cfg->sockfd);
+        cfg->sockfd = -1;
+    }
+    g_udp_fd = -1;
+    cfg->connected = false;
+    cfg->rx_len = 0;
+    cfg->next_connect = time(NULL) + TCP_RECONNECT_SEC;
+    printf("[%s LINK DOWN] %s; reconnect in %ds\n", peer_name(cfg), why, TCP_RECONNECT_SEC);
+}
+
+/* Resolve cfg->target and open the socket. Works for both transports;
+ * for TCP it also performs the connect handshake. */
+static int peer_connect(struct udp_config *cfg)
 {
     struct addrinfo hints = {0};
     struct addrinfo *result = NULL;
@@ -117,14 +226,15 @@ static int udp_init(struct udp_config *cfg, const char *target, uint16_t listen_
     int sockfd = -1;
     int ret;
 
-    if (parse_udp_target(target, host, sizeof(host), &target_port) < 0) {
-        fprintf(stderr, "Invalid UDP target '%s', expected host:port\n", target);
+    if (parse_udp_target(cfg->target, host, sizeof(host), &target_port) < 0) {
+        fprintf(stderr, "Invalid %s target '%s', expected host:port\n",
+                peer_name(cfg), cfg->target);
         return -1;
     }
 
     snprintf(port_str, sizeof(port_str), "%u", target_port);
     hints.ai_family = AF_UNSPEC;
-    hints.ai_socktype = SOCK_DGRAM;
+    hints.ai_socktype = cfg->tcp ? SOCK_STREAM : SOCK_DGRAM;
 
     ret = getaddrinfo(host, port_str, &hints, &result);
     if (ret != 0) {
@@ -137,36 +247,29 @@ static int udp_init(struct udp_config *cfg, const char *target, uint16_t listen_
         if (sockfd < 0)
             continue;
 
-        if (listen_port != 0) {
-            if (rp->ai_family == AF_INET) {
-                struct sockaddr_in local = {0};
-                local.sin_family = AF_INET;
-                local.sin_addr.s_addr = htonl(INADDR_ANY);
-                local.sin_port = htons(listen_port);
-                if (bind(sockfd, (struct sockaddr *)&local, sizeof(local)) < 0) {
-                    close(sockfd);
-                    sockfd = -1;
-                    continue;
-                }
-            } else if (rp->ai_family == AF_INET6) {
-                struct sockaddr_in6 local6 = {0};
-                local6.sin6_family = AF_INET6;
-                local6.sin6_addr = in6addr_any;
-                local6.sin6_port = htons(listen_port);
-                if (bind(sockfd, (struct sockaddr *)&local6, sizeof(local6)) < 0) {
-                    close(sockfd);
-                    sockfd = -1;
-                    continue;
-                }
-            }
+        if (bind_local_port(sockfd, rp->ai_family, cfg->listen_port) < 0) {
+            close(sockfd);
+            sockfd = -1;
+            continue;
         }
 
-        if (connect(sockfd, rp->ai_addr, rp->ai_addrlen) == 0) {
+        if (cfg->tcp) {
+            int one = 1;
+            setsockopt(sockfd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+            setsockopt(sockfd, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof(one));
+            ret = connect_with_timeout(sockfd, rp->ai_addr, rp->ai_addrlen,
+                                       TCP_CONNECT_TIMEOUT_MS);
+        } else {
+            ret = connect(sockfd, rp->ai_addr, rp->ai_addrlen);
+        }
+
+        if (ret == 0) {
             memcpy(&cfg->target_addr, rp->ai_addr, rp->ai_addrlen);
             cfg->target_addrlen = rp->ai_addrlen;
             cfg->sockfd = sockfd;
-            cfg->listen_port = listen_port;
-            cfg->enabled = true;
+            cfg->connected = true;
+            cfg->rx_len = 0;
+            g_udp_fd = sockfd;
             break;
         }
 
@@ -177,12 +280,63 @@ static int udp_init(struct udp_config *cfg, const char *target, uint16_t listen_
     freeaddrinfo(result);
 
     if (sockfd < 0) {
-        perror("udp setup");
+        fprintf(stderr, "%s connect to %s failed: %s\n", peer_name(cfg),
+                cfg->target, strerror(errno));
+        cfg->next_connect = time(NULL) + TCP_RECONNECT_SEC;
         return -1;
     }
 
-    printf("UDP forwarding enabled: target=%s listen_port=%u\n", target, listen_port);
+    printf("[%s LINK UP] target=%s listen_port=%u\n", peer_name(cfg),
+           cfg->target, cfg->listen_port);
     return 0;
+}
+
+static int udp_init(struct udp_config *cfg, const char *target,
+                    uint16_t listen_port, bool tcp)
+{
+    cfg->tcp = tcp;
+    cfg->listen_port = listen_port;
+    cfg->sockfd = -1;
+    cfg->enabled = true;
+    snprintf(cfg->target, sizeof(cfg->target), "%s", target);
+
+    if (!tcp)
+        return peer_connect(cfg);
+
+    /* TCP: the device-side tool may not be up yet; keep trying until the
+     * link is established or we are asked to stop. */
+    while (g_running) {
+        if (peer_connect(cfg) == 0)
+            return 0;
+        sleep(TCP_RECONNECT_SEC);
+    }
+    return -1;
+}
+
+/* Called from the main loop while a TCP link is down. */
+static void peer_maybe_reconnect(struct udp_config *cfg)
+{
+    if (!cfg->tcp || cfg->connected)
+        return;
+    if (time(NULL) < cfg->next_connect)
+        return;
+    peer_connect(cfg);
+}
+
+static int send_all(int sockfd, const uint8_t *buf, size_t len)
+{
+    size_t off = 0;
+
+    while (off < len) {
+        ssize_t w = send(sockfd, buf + off, len - off, MSG_NOSIGNAL);
+        if (w < 0) {
+            if (errno == EINTR)
+                continue;
+            return -1;
+        }
+        off += (size_t)w;
+    }
+    return (int)len;
 }
 
 static void print_mctp_meta(const char *prefix, const uint8_t *buf, int len)
@@ -270,15 +424,42 @@ int write_to_host(uint8_t *out_buf, int len)
 
 static int udp_forward_to_peer(struct udp_config *cfg, uint8_t *buf, int len)
 {
-    int sent = send(cfg->sockfd, buf, len, 0);
+    char label[32];
+    int sent;
 
-    if (sent < 0) {
-        perror("udp send");
-        return -1;
+    snprintf(label, sizeof(label), "FORWARD TO %s", peer_name(cfg));
+
+    if (cfg->tcp) {
+        uint8_t hdr[TCP_FRAME_HDR_LEN];
+
+        if (!cfg->connected) {
+            printf("[%s DROP %d bytes] link down\n", label, len);
+            return -1;
+        }
+        if (len <= 0 || len > MAX_BUF) {
+            printf("[%s DROP %d bytes] bad frame length\n", label, len);
+            return -1;
+        }
+
+        hdr[0] = (uint8_t)((len >> 8) & 0xff);
+        hdr[1] = (uint8_t)(len & 0xff);
+        if (send_all(cfg->sockfd, hdr, sizeof(hdr)) < 0 ||
+            send_all(cfg->sockfd, buf, (size_t)len) < 0) {
+            perror("tcp send");
+            peer_disconnect(cfg, "send failed");
+            return -1;
+        }
+        sent = len;
+    } else {
+        sent = send(cfg->sockfd, buf, len, 0);
+        if (sent < 0) {
+            perror("udp send");
+            return -1;
+        }
     }
 
-    printf("[FORWARD TO UDP %d bytes]\n", sent);
-    print_mctp_meta("FORWARD TO UDP", buf, sent);
+    printf("[%s %d bytes]\n", label, sent);
+    print_mctp_meta(label, buf, sent);
     print_hex(buf, sent);
     return sent;
 }
@@ -316,21 +497,13 @@ static int send_control_request(int fd, struct udp_config *udp, bool no_bridge,
     return write(fd, out_buf, len);
 }
 
-static int udp_forward_to_bridge(struct udp_config *cfg, bool no_bridge)
+static int deliver_peer_frame(struct udp_config *cfg, uint8_t *buf, int n, bool no_bridge)
 {
-    uint8_t buf[MAX_BUF];
-    int n = recv(cfg->sockfd, buf, sizeof(buf), 0);
+    char label[32];
 
-    if (n < 0) {
-        perror("udp recv");
-        return -1;
-    }
-
-    if (n == 0)
-        return 0;
-
-    printf("[RECV FROM UDP %d bytes]\n", n);
-    print_mctp_meta("RECV FROM UDP", buf, n);
+    snprintf(label, sizeof(label), "RECV FROM %s", peer_name(cfg));
+    printf("[%s %d bytes]\n", label, n);
+    print_mctp_meta(label, buf, n);
     print_hex(buf, n);
     if (no_bridge) {
         printf("[MOCK BRIDGE RX %d bytes]\n", n);
@@ -341,6 +514,60 @@ static int udp_forward_to_bridge(struct udp_config *cfg, bool no_bridge)
     return write_to_host(buf, n);
 }
 
+/* Returns <0 only on a fatal error; a dropped TCP link is handled by
+ * scheduling a reconnect and returning 0. */
+static int udp_forward_to_bridge(struct udp_config *cfg, bool no_bridge)
+{
+    if (!cfg->tcp) {
+        uint8_t buf[MAX_BUF];
+        int n = recv(cfg->sockfd, buf, sizeof(buf), 0);
+
+        if (n < 0) {
+            perror("udp recv");
+            return -1;
+        }
+        if (n == 0)
+            return 0;
+        return deliver_peer_frame(cfg, buf, n, no_bridge);
+    }
+
+    ssize_t n = recv(cfg->sockfd, cfg->rx_buf + cfg->rx_len,
+                     sizeof(cfg->rx_buf) - cfg->rx_len, 0);
+    if (n < 0) {
+        if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)
+            return 0;
+        perror("tcp recv");
+        peer_disconnect(cfg, "recv failed");
+        return 0;
+    }
+    if (n == 0) {
+        peer_disconnect(cfg, "peer closed");
+        return 0;
+    }
+    cfg->rx_len += (size_t)n;
+
+    /* Reassemble length-prefixed frames; a partial frame stays buffered. */
+    while (cfg->rx_len >= TCP_FRAME_HDR_LEN) {
+        size_t flen = ((size_t)cfg->rx_buf[0] << 8) | cfg->rx_buf[1];
+
+        if (flen == 0 || flen > MAX_BUF) {
+            fprintf(stderr, "tcp frame length %zu out of range, resetting link\n", flen);
+            peer_disconnect(cfg, "framing error");
+            return 0;
+        }
+        if (cfg->rx_len < TCP_FRAME_HDR_LEN + flen)
+            break;
+
+        if (deliver_peer_frame(cfg, cfg->rx_buf + TCP_FRAME_HDR_LEN, (int)flen, no_bridge) < 0)
+            return -1;
+
+        cfg->rx_len -= TCP_FRAME_HDR_LEN + flen;
+        if (cfg->rx_len)
+            memmove(cfg->rx_buf, cfg->rx_buf + TCP_FRAME_HDR_LEN + flen, cfg->rx_len);
+    }
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     struct udp_config udp = {0};
@@ -348,16 +575,18 @@ int main(int argc, char **argv)
     const char *udp_target = NULL;
     const char *control_data = NULL;
     uint16_t listen_port = 0;
+    bool use_tcp = false;
     bool no_bridge = false;
     bool once = false;
     int fd = -1;
 
     for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "--udp") == 0) {
-            if (i + 1 >= argc) {
+        if (strcmp(argv[i], "--udp") == 0 || strcmp(argv[i], "--tcp") == 0) {
+            if (i + 1 >= argc || udp_target != NULL) {
                 print_usage(argv[0]);
                 return 1;
             }
+            use_tcp = (argv[i][2] == 't');
             udp_target = argv[++i];
         } else if (strcmp(argv[i], "--listen-port") == 0) {
             if (i + 1 >= argc || parse_port(argv[i + 1], &listen_port) < 0) {
@@ -390,7 +619,7 @@ int main(int argc, char **argv)
         }
     }
 
-    if ((udp_target != NULL) != (listen_port != 0)) {
+    if (!use_tcp && (udp_target != NULL) != (listen_port != 0)) {
         fprintf(stderr, "Both --udp and --listen-port are required for UDP mode\n");
         return 1;
     }
@@ -416,16 +645,14 @@ int main(int argc, char **argv)
         printf("Running in no-bridge mode.\n");
     }
 
-    if (udp_target && udp_init(&udp, udp_target, listen_port) < 0) {
+    atexit(cleanup_all);
+    setup_signals();
+
+    if (udp_target && udp_init(&udp, udp_target, listen_port, use_tcp) < 0) {
         if (fd >= 0)
             close(fd);
         return 1;
     }
-
-    if (udp.enabled)
-        g_udp_fd = udp.sockfd;
-    atexit(cleanup_all);
-    setup_signals();
 
     if (send_control_request(fd, &udp, no_bridge, &control) < 0)
         return 1;
@@ -436,7 +663,10 @@ int main(int argc, char **argv)
     while (g_running) {
         struct pollfd pfds[2];
         nfds_t nfds = 0;
+        int udp_index = -1;
         int ret;
+
+        peer_maybe_reconnect(&udp);
 
         if (fd >= 0) {
             pfds[nfds].fd = fd;
@@ -445,7 +675,8 @@ int main(int argc, char **argv)
             nfds++;
         }
 
-        if (udp.enabled) {
+        if (udp.enabled && udp.connected) {
+            udp_index = (int)nfds;
             pfds[nfds].fd = udp.sockfd;
             pfds[nfds].events = POLLIN;
             pfds[nfds].revents = 0;
@@ -479,14 +710,12 @@ int main(int argc, char **argv)
                 break;
         }
 
-        if (udp.enabled) {
-            int udp_index = (fd >= 0) ? 1 : 0;
-            if (ret > 0 && (pfds[udp_index].revents & POLLIN)) {
-                if (udp_forward_to_bridge(&udp, no_bridge) < 0)
-                    break;
-                if (once)
-                    break;
-            }
+        if (udp_index >= 0 && ret > 0 &&
+            (pfds[udp_index].revents & (POLLIN | POLLHUP | POLLERR))) {
+            if (udp_forward_to_bridge(&udp, no_bridge) < 0)
+                break;
+            if (once)
+                break;
         }
 
         if (!udp.enabled || no_bridge) {
@@ -512,7 +741,7 @@ int main(int argc, char **argv)
                         continue;
                     }
 
-                    printf("[SEND UDP %d bytes]\n", len);
+                    printf("[SEND %s %d bytes]\n", peer_name(&udp), len);
                     print_hex(out_buf, len);
                     udp_forward_to_peer(&udp, out_buf, len);
                     if (once)
@@ -544,8 +773,9 @@ int main(int argc, char **argv)
         }
     }
 
-    if (udp.enabled) {
+    if (udp.enabled && udp.sockfd >= 0) {
         close(udp.sockfd);
+        udp.sockfd = -1;
         g_udp_fd = -1;
     }
     g_fd = -1;
