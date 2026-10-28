@@ -26,6 +26,9 @@
 #define MCTP_CTRL_CMD_GET_ENDPOINT_ID 0x02
 #define PLDM_TYPE 0x01
 
+/* -d/--dest-eid: the EID routed to the bridge instance under test */
+static unsigned int g_dest_eid = DEST_EID;
+
 static const char *completion_code_name(uint8_t cc)
 {
     switch (cc) {
@@ -107,7 +110,7 @@ static int mctp_ctrl_request(int sock, bool get_eid, uint8_t set_eid, uint8_t se
     memset(&dst, 0, sizeof(dst));
     dst.smctp_family = AF_MCTP;
     dst.smctp_network = 1;
-    dst.smctp_addr.s_addr = DEST_EID;
+    dst.smctp_addr.s_addr = g_dest_eid;
     dst.smctp_type = MCTP_CTRL_MSG_TYPE;
     dst.smctp_tag = MCTP_TAG_OWNER;
 
@@ -296,7 +299,7 @@ int pldm_test(void) {
     memset(&dst, 0, sizeof(dst));
     dst.smctp_family = AF_MCTP;
     dst.smctp_network = 1;
-    dst.smctp_addr.s_addr = DEST_EID;
+    dst.smctp_addr.s_addr = g_dest_eid;
     dst.smctp_type = PLDM_TYPE;
     dst.smctp_tag = MCTP_TAG_OWNER;
 
@@ -355,9 +358,42 @@ int pldm_test(void) {
     return 0;
 }
 
+/* Strip -d/--dest-eid <eid> from argv; returns the new argc or -1. */
+static int take_dest_eid(int argc, char **argv)
+{
+    int out = 1;
+
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "-d") == 0 || strcmp(argv[i], "--dest-eid") == 0) {
+            char *end = NULL;
+            unsigned long value;
+
+            if (i + 1 >= argc)
+                return -1;
+            value = strtoul(argv[i + 1], &end, 10);
+            if (!argv[i + 1][0] || (end && *end) || value == 0 || value > 0xfe) {
+                fprintf(stderr, "Invalid destination EID '%s'\n", argv[i + 1]);
+                return -1;
+            }
+            g_dest_eid = (unsigned int)value;
+            i++;
+            continue;
+        }
+        argv[out++] = argv[i];
+    }
+    argv[out] = NULL;
+    return out;
+}
+
 int main(int argc, char **argv) {
     if (signal(SIGINT, on_sigint) == SIG_ERR) {
         perror("signal");
+        return -1;
+    }
+    argc = take_dest_eid(argc, argv);
+    if (argc < 0) {
+        fprintf(stderr, "Usage: %s [-d <dest-eid>] [--get-eid] [--set-eid <eid>] [--op <0|1|2|3>]\n",
+                argv[0]);
         return -1;
     }
     if (argc == 1) {

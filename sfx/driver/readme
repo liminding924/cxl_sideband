@@ -37,6 +37,27 @@ sudo ./send
 
 
 
+## 多个 DUT / 多个 bridge：每个 EID 一个实例
+一个实例 = 一个 netdev + 一个字符设备 + 自己的发送队列。所有 bridge 共用一个
+/dev/mctp_bridge 时，谁先 read 谁拿走报文（不看 EID），别人的请求会被静默抢走。
+现在字符设备只允许一个进程打开，第二个 bridge 会 open 失败 (EBUSY)。
+
+    EIDS="8 10" ./setup.sh      # 等价于下面几步
+    sudo insmod mctp_bridge.ko nr_devs=2
+    sudo ip link set mctp_bridge0 up && sudo mctp route add 8  via mctp_bridge0   # /dev/mctp_bridge
+    sudo ip link set mctp_bridge1 up && sudo mctp route add 10 via mctp_bridge1   # /dev/mctp_bridge1
+    sudo mctp address add 19 dev mctp_bridge0
+
+    sudo ./bridge --tcp host:port                                              # EID 8
+    sudo ./bridge --dev /dev/mctp_bridge1 --dev-eid 10 --udp host:port --listen-port 19092   # EID 10
+    sudo ./send -d 10 --set-eid 10
+    pldmtool base GetTID -m 10
+
+模块参数：nr_devs（1-8，默认 1）、first_index（第一个实例的编号，默认 0）、
+exclusive（字符设备独占打开，默认 Y）。默认参数下行为和单实例版本一致。
+不想动正在用的模块时，可以把 mctp_bridge.c 复制成别的名字（如 mctp_bridge_x.c）
+单独编译，用 first_index=1 加载：class/chrdev 按模块名区分，两个模块可以并存。
+
 ## Some Useful debug command
 sudo ip link show
 

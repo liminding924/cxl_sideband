@@ -5,6 +5,7 @@
 @Mail: wei.hou@scaleflux.com
 @Created Time: 2025-11-19 18:39:43
 @Log: Fixed for Linux kernel 6.14+
+      2026-10-28 multiple instances (nr_devs), one TX queue per instance
 ************************************************************************/
 // mctp_bridge.c – Fixed for Linux kernel 6.14+
 // Changes:
@@ -12,6 +13,9 @@
 // 2. Removed dev->tx_queue usage
 // 3. Correctly use struct sk_buff_head
 // 4. Clean minimal bridge prototype
+// 5. nr_devs instances, each with its own netdev, char device and TX queue,
+//    so daemons serving different EIDs never take each other's frames
+// 6. No sleeping lock in ndo_start_xmit; char device is single-open
 
 #include <linux/module.h>
 #include <linux/init.h>
@@ -23,7 +27,9 @@
 #include <linux/uaccess.h>
 #include <linux/wait.h>
 #include <linux/poll.h>
-#include <linux/mutex.h>
+#include <linux/sched.h>
+#include <linux/slab.h>
+#include <linux/atomic.h>
 #include <linux/if_arp.h>
 #include <net/mctp.h>
 
@@ -40,22 +46,44 @@
 #endif
 
 
-#define DRV_NAME "mctp_bridge"
-#define DEV_NAME "mctp_bridge"
-#define DEFAULT_DEVNAME "mctp_bridge0"
 #define CHAR_DEV_BUF_MAX (64 * 1024)
 #define MCTP_DEFAULT_EID 8  /* Default MCTP Endpoint ID */
 #define MCTP_MTU 1024       /* MCTP Maximum Transmission Unit */
+#define MBRIDGE_MAX_DEVS 8
+#define MBRIDGE_TXQ_MAX 256 /* frames held for the daemon before dropping */
 
-static struct net_device *mbridge_dev;
+/*
+ * One instance = one MCTP netdev + one char device + its own TX queue.
+ * Route each remote EID to its own netdev (mctp route add <eid> via
+ * mctp_bridgeN) and run one bridge daemon per char device.
+ *
+ * Index 0 keeps the original names: mctp_bridge0 and /dev/mctp_bridge.
+ * Index N > 0 is mctp_bridgeN and /dev/mctp_bridgeN.
+ */
+static unsigned int nr_devs = 1;
+module_param(nr_devs, uint, 0444);
+MODULE_PARM_DESC(nr_devs, "Number of bridge instances (1-8, default 1)");
+
+static unsigned int first_index;
+module_param(first_index, uint, 0444);
+MODULE_PARM_DESC(first_index, "Index of the first instance (default 0)");
+
+static bool exclusive = true;
+module_param(exclusive, bool, 0444);
+MODULE_PARM_DESC(exclusive, "One opener per char device (default Y)");
+
+struct mbridge {
+    struct net_device *ndev;
+    struct cdev cdev;
+    dev_t devt;
+    struct sk_buff_head tx_to_daemon;
+    wait_queue_head_t tx_wq;
+    atomic_t open_count;
+};
+
+static struct mbridge *mbridges[MBRIDGE_MAX_DEVS];
 static dev_t mbridge_devnum;
-static struct cdev mbridge_cdev;
 static struct class *mbridge_class;
-
-/* correct type for skb queue */
-static struct sk_buff_head tx_to_daemon;
-static wait_queue_head_t tx_wq;
-static DEFINE_MUTEX(tx_queue_lock);  // Add mutex lock
 
 /* netdev ops */
 static netdev_tx_t mbridge_start_xmit(struct sk_buff *skb, struct net_device *dev);
@@ -84,73 +112,86 @@ static int mbridge_stop(struct net_device *dev)
     return 0;
 }
 
+/*
+ * Runs with BH disabled and must not sleep. sk_buff_head has its own
+ * spinlock, so skb_queue_tail/skb_dequeue need no extra lock.
+ */
 static netdev_tx_t mbridge_start_xmit(struct sk_buff *skb, struct net_device *dev)
 {
-    struct sk_buff *nskb;
+    struct mbridge *mb = *(struct mbridge **)netdev_priv(dev);
 
-    nskb = skb_clone(skb, GFP_ATOMIC);
-    if (!nskb) {
+    /* No daemon reading: drop instead of growing without bound. */
+    if (skb_queue_len(&mb->tx_to_daemon) >= MBRIDGE_TXQ_MAX) {
         dev->stats.tx_dropped++;
         dev_kfree_skb_any(skb);
         return NETDEV_TX_OK;
     }
 
-    /* Queue for the char device reader */
-    mutex_lock(&tx_queue_lock);  // Lock
-
     /* Print SKB key information and first 5 bytes */
     dev_dbg(&dev->dev, "%s SKB info: len=%u, protocol=0x%04x, data=%*ph\n",
-            __func__,nskb->len,  ntohs(nskb->protocol), 5, nskb->data);
-
-    skb_queue_tail(&tx_to_daemon, nskb);
-    mutex_unlock(&tx_queue_lock);  // Unlock
-    wake_up_interruptible(&tx_wq);
+            __func__, skb->len, ntohs(skb->protocol), 5, skb->data);
 
     dev->stats.tx_packets++;
-    dev->stats.tx_bytes += nskb->len;
+    dev->stats.tx_bytes += skb->len;
 
-    dev_kfree_skb_any(skb);
+    /* Queue for the char device reader */
+    skb_orphan(skb);
+    skb_queue_tail(&mb->tx_to_daemon, skb);
+    wake_up_interruptible(&mb->tx_wq);
+
     return NETDEV_TX_OK;
 }
 
-/* char device read/write */
+/* char device open/release/read/write */
+static int mbridge_chr_open(struct inode *inode, struct file *file)
+{
+    struct mbridge *mb = container_of(inode->i_cdev, struct mbridge, cdev);
+
+    if (exclusive && atomic_inc_return(&mb->open_count) > 1) {
+        atomic_dec(&mb->open_count);
+        pr_warn("%s: char device busy, open by pid %d (%s) refused\n",
+                mb->ndev->name, task_pid_nr(current), current->comm);
+        return -EBUSY;
+    }
+
+    file->private_data = mb;
+    return nonseekable_open(inode, file);
+}
+
+static int mbridge_chr_release(struct inode *inode, struct file *file)
+{
+    struct mbridge *mb = file->private_data;
+
+    if (exclusive)
+        atomic_dec(&mb->open_count);
+    return 0;
+}
+
 static ssize_t mbridge_chr_read(struct file *file, char __user *buf,
                                 size_t count, loff_t *ppos)
 {
+    struct mbridge *mb = file->private_data;
     struct sk_buff *skb;
     size_t to_copy;
-    int ret = 0;
+    int ret;
 
     if (count == 0)
         return 0;
 
-    if (*ppos != 0)
-        return 0;
-
-    mutex_lock(&tx_queue_lock);
-    skb = skb_dequeue(&tx_to_daemon);
-    mutex_unlock(&tx_queue_lock);
-
-    if (!skb) {
+    /* Another reader (exclusive=N) may win the frame: wait again. */
+    while (!(skb = skb_dequeue(&mb->tx_to_daemon))) {
         if (file->f_flags & O_NONBLOCK)
             return -EAGAIN;
 
-        ret = wait_event_interruptible(tx_wq,
-                !skb_queue_empty(&tx_to_daemon));
+        ret = wait_event_interruptible(mb->tx_wq,
+                !skb_queue_empty(&mb->tx_to_daemon));
         if (ret)
             return ret;
-
-        mutex_lock(&tx_queue_lock);
-        skb = skb_dequeue(&tx_to_daemon);
-        mutex_unlock(&tx_queue_lock);
-
-        if (!skb)
-            return -EIO;
     }
 
     /* Print SKB key information and first 5 bytes */
-    dev_dbg(&mbridge_dev->dev, "%s SKB info: len=%u, protocol=0x%04x, data=%*ph\n",
-            __func__, skb->len,  ntohs(skb->protocol), 5, skb->data);
+    dev_dbg(&mb->ndev->dev, "%s SKB info: len=%u, protocol=0x%04x, data=%*ph\n",
+            __func__, skb->len, ntohs(skb->protocol), 5, skb->data);
 
     to_copy = min(count, (size_t)skb->len);
 
@@ -166,11 +207,10 @@ static ssize_t mbridge_chr_read(struct file *file, char __user *buf,
 static ssize_t mbridge_chr_write(struct file *file, const char __user *buf,
                                  size_t count, loff_t *ppos)
 {
+    struct mbridge *mb = file->private_data;
+    struct net_device *ndev = mb->ndev;
     struct sk_buff *skb;
     void *data;
-
-    if (!mbridge_dev)
-        return -ENODEV;
 
     if (count == 0)
         return 0;
@@ -178,10 +218,7 @@ static ssize_t mbridge_chr_write(struct file *file, const char __user *buf,
     if (count > CHAR_DEV_BUF_MAX)
         return -E2BIG;
 
-    if (*ppos != 0)
-        return 0;
-
-    skb = netdev_alloc_skb_ip_align(mbridge_dev, count + NET_IP_ALIGN);
+    skb = netdev_alloc_skb_ip_align(ndev, count + NET_IP_ALIGN);
     if (!skb)
         return -ENOMEM;
 
@@ -192,7 +229,7 @@ static ssize_t mbridge_chr_write(struct file *file, const char __user *buf,
         return -EFAULT;
     }
 
-    skb->dev = mbridge_dev;
+    skb->dev = ndev;
     skb->protocol = htons(ETH_P_MCTP);  // Set to MCTP protocol
     /*init magic for mctp cb*/
     __mctp_cb(skb);
@@ -201,37 +238,40 @@ static ssize_t mbridge_chr_write(struct file *file, const char __user *buf,
     skb_reset_mac_header(skb);
     skb_reset_network_header(skb);
 
-    mbridge_dev->stats.rx_packets++;
-    mbridge_dev->stats.rx_bytes += count;
+    ndev->stats.rx_packets++;
+    ndev->stats.rx_bytes += count;
 
 
    /* Print SKB key information and first bytes */
-    dev_dbg(&mbridge_dev->dev, "%s SKB info: len=%u, protocol=0x%04x, data=%*ph\n",
-            __func__, skb->len,  ntohs(skb->protocol), (int)count, skb->data);
+    dev_dbg(&ndev->dev, "%s SKB info: len=%u, protocol=0x%04x, data=%*ph\n",
+            __func__, skb->len, ntohs(skb->protocol), (int)count, skb->data);
 
+    /* netif_rx() frees the skb itself when it drops it. */
     if (netif_rx(skb) != NET_RX_SUCCESS) {
-        dev_err(&mbridge_dev->dev, "Failed to enqueue packet for processing\n");
-        dev_kfree_skb_any(skb);
+        dev_err(&ndev->dev, "Failed to enqueue packet for processing\n");
         return -EIO;
     }
 
     return count;
 }
 
-static unsigned int mbridge_chr_poll(struct file *file, poll_table *wait)
+static __poll_t mbridge_chr_poll(struct file *file, poll_table *wait)
 {
-    unsigned int mask = 0;
+    struct mbridge *mb = file->private_data;
+    __poll_t mask = 0;
 
-    poll_wait(file, &tx_wq, wait);
+    poll_wait(file, &mb->tx_wq, wait);
 
-    if (!skb_queue_empty(&tx_to_daemon))
-        mask |= POLLIN | POLLRDNORM;
+    if (!skb_queue_empty(&mb->tx_to_daemon))
+        mask |= EPOLLIN | EPOLLRDNORM;
 
     return mask;
 }
 
 static const struct file_operations mbridge_fops = {
     .owner   = THIS_MODULE,
+    .open    = mbridge_chr_open,
+    .release = mbridge_chr_release,
     .read    = mbridge_chr_read,
     .write   = mbridge_chr_write,
     .poll    = mbridge_chr_poll,
@@ -255,77 +295,134 @@ static void mctp_setup(struct net_device *dev)
     dev->netdev_ops = &mbridge_netdev_ops;
 }
 
-/* init / exit */
-static int __init mbridge_init(void)
+static void mbridge_destroy(struct mbridge *mb)
 {
+    device_destroy(mbridge_class, mb->devt);
+    cdev_del(&mb->cdev);
+    unregister_netdev(mb->ndev);
+    free_netdev(mb->ndev);
+    skb_queue_purge(&mb->tx_to_daemon);
+    kfree(mb);
+}
+
+static int mbridge_create(unsigned int slot)
+{
+    unsigned int index = first_index + slot;
+    char ifname[IFNAMSIZ];
+    struct device *chr;
+    struct mbridge *mb;
     int ret;
 
-    skb_queue_head_init(&tx_to_daemon);
-    init_waitqueue_head(&tx_wq);
-
-    mbridge_dev = alloc_netdev(0, DEFAULT_DEVNAME, NET_NAME_ENUM, mctp_setup);
-    if (!mbridge_dev)
+    mb = kzalloc(sizeof(*mb), GFP_KERNEL);
+    if (!mb)
         return -ENOMEM;
 
-    ret = register_netdev(mbridge_dev);
+    mb->devt = MKDEV(MAJOR(mbridge_devnum), MINOR(mbridge_devnum) + slot);
+    skb_queue_head_init(&mb->tx_to_daemon);
+    init_waitqueue_head(&mb->tx_wq);
+    atomic_set(&mb->open_count, 0);
+
+    snprintf(ifname, sizeof(ifname), "mctp_bridge%u", index);
+    mb->ndev = alloc_netdev(sizeof(struct mbridge *), ifname, NET_NAME_ENUM,
+                            mctp_setup);
+    if (!mb->ndev) {
+        ret = -ENOMEM;
+        goto err_free;
+    }
+    *(struct mbridge **)netdev_priv(mb->ndev) = mb;
+
+    ret = register_netdev(mb->ndev);
     if (ret)
         goto err_free_netdev;
 
-    /* char device for userspace read/write/poll*/
-    ret = alloc_chrdev_region(&mbridge_devnum, 0, 1, DEV_NAME);
+    /* char device for userspace read/write/poll */
+    cdev_init(&mb->cdev, &mbridge_fops);
+    mb->cdev.owner = THIS_MODULE;
+    ret = cdev_add(&mb->cdev, mb->devt, 1);
     if (ret)
         goto err_unregister_netdev;
 
-    cdev_init(&mbridge_cdev, &mbridge_fops);
-    ret = cdev_add(&mbridge_cdev, mbridge_devnum, 1);
-    if (ret)
-        goto err_unregister_chrdev;
-
-    mbridge_class = CLASS_CREATE("mctp_bridge_class");
-    if (IS_ERR(mbridge_class)) {
-        ret = PTR_ERR(mbridge_class);
-        pr_err("mctp_bridge: failed to create class\n");
+    if (index == 0)
+        chr = device_create(mbridge_class, NULL, mb->devt, NULL, "mctp_bridge");
+    else
+        chr = device_create(mbridge_class, NULL, mb->devt, NULL,
+                            "mctp_bridge%u", index);
+    if (IS_ERR(chr)) {
+        ret = PTR_ERR(chr);
         goto err_cdev_del;
     }
 
-    device_create(mbridge_class, NULL, mbridge_devnum, NULL, DEV_NAME);
-
-    pr_info("mctp_bridge: loaded OK\n");
+    mbridges[slot] = mb;
+    pr_info("%s: %s <-> /dev/%s\n", KBUILD_MODNAME, ifname, dev_name(chr));
     return 0;
 
 err_cdev_del:
-    cdev_del(&mbridge_cdev);
-err_unregister_chrdev:
-    unregister_chrdev_region(mbridge_devnum, 1);
+    cdev_del(&mb->cdev);
 err_unregister_netdev:
-    unregister_netdev(mbridge_dev);
+    unregister_netdev(mb->ndev);
 err_free_netdev:
-    free_netdev(mbridge_dev);
+    free_netdev(mb->ndev);
+err_free:
+    kfree(mb);
+    return ret;
+}
+
+/* init / exit */
+static int __init mbridge_init(void)
+{
+    unsigned int i;
+    int ret;
+
+    if (nr_devs < 1 || nr_devs > MBRIDGE_MAX_DEVS) {
+        pr_err("%s: nr_devs must be 1..%d\n", KBUILD_MODNAME, MBRIDGE_MAX_DEVS);
+        return -EINVAL;
+    }
+
+    ret = alloc_chrdev_region(&mbridge_devnum, 0, nr_devs, KBUILD_MODNAME);
+    if (ret)
+        return ret;
+
+    /* Named after the module, so a renamed build can load alongside. */
+    mbridge_class = CLASS_CREATE(KBUILD_MODNAME "_class");
+    if (IS_ERR(mbridge_class)) {
+        ret = PTR_ERR(mbridge_class);
+        pr_err("%s: failed to create class\n", KBUILD_MODNAME);
+        goto err_unregister_chrdev;
+    }
+
+    for (i = 0; i < nr_devs; i++) {
+        ret = mbridge_create(i);
+        if (ret) {
+            pr_err("%s: instance %u failed: %d\n", KBUILD_MODNAME,
+                   first_index + i, ret);
+            goto err_destroy;
+        }
+    }
+
+    pr_info("%s: loaded OK, %u instance(s)\n", KBUILD_MODNAME, nr_devs);
+    return 0;
+
+err_destroy:
+    while (i--)
+        mbridge_destroy(mbridges[i]);
+    class_destroy(mbridge_class);
+err_unregister_chrdev:
+    unregister_chrdev_region(mbridge_devnum, nr_devs);
     return ret;
 }
 
 static void __exit mbridge_exit(void)
 {
-    if (mbridge_class && !IS_ERR(mbridge_class)) {
-        device_destroy(mbridge_class, mbridge_devnum);
-        class_destroy(mbridge_class);
-    }
+    unsigned int i;
 
-    if (mbridge_devnum) {
-        cdev_del(&mbridge_cdev);
-        unregister_chrdev_region(mbridge_devnum, 1);
-    }
+    for (i = 0; i < nr_devs; i++)
+        if (mbridges[i])
+            mbridge_destroy(mbridges[i]);
 
-    if (mbridge_dev) {
-        unregister_netdev(mbridge_dev);
-        free_netdev(mbridge_dev);
-    }
+    class_destroy(mbridge_class);
+    unregister_chrdev_region(mbridge_devnum, nr_devs);
 
-    mutex_lock(&tx_queue_lock);  // Lock during cleanup
-    skb_queue_purge(&tx_to_daemon);
-    mutex_unlock(&tx_queue_lock);  // Unlock
-
-    pr_info("mctp_bridge: unloaded\n");
+    pr_info("%s: unloaded\n", KBUILD_MODNAME);
 }
 
 module_init(mbridge_init);
@@ -333,5 +430,4 @@ module_exit(mbridge_exit);
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("mctp bridge");
-MODULE_DESCRIPTION("mctp_bridge netdev + char device for BridgeDaemon");
-
+MODULE_DESCRIPTION("mctp_bridge netdevs + char devices for BridgeDaemon, one per instance");

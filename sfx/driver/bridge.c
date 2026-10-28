@@ -27,6 +27,11 @@
 #define HOST_EID 19
 #define MSG_TYPE_CONTROL 0
 
+/* Overridable with --dev / --dev-eid / --host-eid, one bridge per instance */
+static const char *g_device = DEVICE;
+static uint8_t g_dev_eid = DEV_EID;
+static uint8_t g_host_eid = HOST_EID;
+
 uint8_t cur_tag = 0;
 int g_fd = 0;
 
@@ -100,9 +105,24 @@ static void print_usage(const char *prog)
 {
     printf("Usage: %s [--udp host:port --listen-port port | --tcp host:port [--listen-port port]]\n"
            "          [--no-bridge] [--once] [--control ctrl-opc] [--control-data \"hex bytes\"]\n"
+           "          [--dev path] [--dev-eid eid] [--host-eid eid]\n"
            "  --udp  legacy datagram link, one datagram per MCTP frame\n"
-           "  --tcp  reliable stream link, 2-byte length-prefixed MCTP frames, auto-reconnect\n",
-           prog);
+           "  --tcp  reliable stream link, 2-byte length-prefixed MCTP frames, auto-reconnect\n"
+           "  --dev  mctp_bridge char device (default " DEVICE "); run one bridge per\n"
+           "         device, e.g. /dev/mctp_bridge1 for netdev mctp_bridge1\n"
+           "  --dev-eid / --host-eid  EIDs for --control and typed frames (default %d / %d)\n",
+           prog, DEV_EID, HOST_EID);
+}
+
+static int parse_eid(const char *s, uint8_t *eid)
+{
+    char *end = NULL;
+    unsigned long v = strtoul(s, &end, 0);
+
+    if (!*s || *end || v > 0xff)
+        return -1;
+    *eid = (uint8_t)v;
+    return 0;
 }
 
 static int parse_port(const char *s, uint16_t *port)
@@ -475,8 +495,8 @@ static int send_control_request(int fd, struct udp_config *udp, bool no_bridge,
         return 0;
 
     hdr->ver = 0x01;
-    hdr->dst = DEV_EID;
-    hdr->src = HOST_EID;
+    hdr->dst = g_dev_eid;
+    hdr->src = g_host_eid;
     hdr->flags_seq_tag = 0xC8;
     out_buf[4] = MSG_TYPE_CONTROL;
     out_buf[5] = 0x80;
@@ -613,6 +633,20 @@ int main(int argc, char **argv)
                 return 1;
             }
             control_data = argv[++i];
+        } else if (strcmp(argv[i], "--dev") == 0) {
+            if (i + 1 >= argc) {
+                print_usage(argv[0]);
+                return 1;
+            }
+            g_device = argv[++i];
+        } else if (strcmp(argv[i], "--dev-eid") == 0 || strcmp(argv[i], "--host-eid") == 0) {
+            uint8_t *eid = (argv[i][2] == 'd') ? &g_dev_eid : &g_host_eid;
+
+            if (i + 1 >= argc || parse_eid(argv[i + 1], eid) < 0) {
+                print_usage(argv[0]);
+                return 1;
+            }
+            i++;
         } else {
             print_usage(argv[0]);
             return 1;
@@ -633,13 +667,16 @@ int main(int argc, char **argv)
     }
 
     if (!no_bridge) {
-        fd = open(DEVICE, O_RDWR);
+        fd = open(g_device, O_RDWR);
         if (fd < 0) {
-            perror("open");
+            if (errno == EBUSY)
+                fprintf(stderr, "open %s: busy, another bridge already serves it\n", g_device);
+            else
+                perror("open");
             return 1;
         }
         g_fd = fd;
-        printf("Opened %s successfully.\n", DEVICE);
+        printf("Opened %s successfully.\n", g_device);
         printf("Waiting for incoming MCTP frames via poll() ...\n");
     } else {
         printf("Running in no-bridge mode.\n");
@@ -751,8 +788,8 @@ int main(int argc, char **argv)
 
                 memset(out_buf, 0, sizeof(out_buf));
                 hdr->ver = 0x01;
-                hdr->dst = HOST_EID;
-                hdr->src = DEV_EID;
+                hdr->dst = g_host_eid;
+                hdr->src = g_dev_eid;
                 hdr->flags_seq_tag = cur_tag & 0xF7;
                 out_buf[4] = MSG_TYPE_PLDM;
 
