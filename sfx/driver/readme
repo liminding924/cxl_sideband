@@ -47,11 +47,18 @@ sudo ./send
     sudo ip link set mctp_bridge0 up && sudo mctp route add 8  via mctp_bridge0   # /dev/mctp_bridge
     sudo ip link set mctp_bridge1 up && sudo mctp route add 10 via mctp_bridge1   # /dev/mctp_bridge1
     sudo mctp address add 19 dev mctp_bridge0
+    sudo mctp address add 19 dev mctp_bridge1    # 每个实例都要有本地 EID，否则 sendto 报 No route to host
 
     sudo ./bridge --tcp host:port                                              # EID 8
     sudo ./bridge --dev /dev/mctp_bridge1 --dev-eid 10 --udp host:port --listen-port 19092   # EID 10
     sudo ./send -d 10 --set-eid 10
     pldmtool base GetTID -m 10
+
+对端（如 i3cProxy gateway）只收目的 EID 为 0 或当前 EID 的包时，先绕过内核把 DUT
+改到新 EID（不开字符设备，直接走 UDP，目的 EID 用旧的 8）：
+
+    ./bridge --no-bridge --udp host:port --listen-port 19093 --dev-eid 8 \
+             --control 01 --control-data "00 0a" --once     # SetEID 10
 
 模块参数：nr_devs（1-8，默认 1）、first_index（第一个实例的编号，默认 0）、
 exclusive（字符设备独占打开，默认 Y）。默认参数下行为和单实例版本一致。

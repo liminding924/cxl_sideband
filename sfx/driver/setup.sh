@@ -35,8 +35,10 @@ for eid in $EIDS; do
     sudo mctp route add $eid via $dev
     #sudo mctp address add $eid dev $dev
 
-    ### set the local dev eid so bind/recvfrom can get msg
-    [ $i -eq 0 ] && sudo mctp address add $LOCAL_EID dev $dev
+    ### set the local dev eid so bind/recvfrom can get msg; every instance
+    ### needs one, sendto() takes the source EID from the output netdev
+    ### (EHOSTUNREACH without it). The same EID may sit on several netdevs.
+    sudo mctp address add $LOCAL_EID dev $dev
 
     ## show route & eid cfg
     sudo mctp link show $dev
