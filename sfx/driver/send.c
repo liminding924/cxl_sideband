@@ -134,6 +134,7 @@ static int mctp_ctrl_request(int sock, bool get_eid, uint8_t set_eid, uint8_t se
             return -1;
         } else if (ret == 0) {
             printf("Timeout: no data received within 5 seconds\n");
+            return -1;
         } else {
             uint8_t recv_buf[128];
             struct sockaddr_mctp from_addr;
@@ -143,6 +144,7 @@ static int mctp_ctrl_request(int sock, bool get_eid, uint8_t set_eid, uint8_t se
                                     (struct sockaddr*)&from_addr, &from_len);
             if (received < 0) {
                 perror("recvfrom");
+                return -1;
             } else {
                 printf("Received %zd bytes from EID %u, msgType: 0x%02x\n",
                        received, from_addr.smctp_addr.s_addr, from_addr.smctp_type);
@@ -180,11 +182,11 @@ static int mctp_ctrl_request(int sock, bool get_eid, uint8_t set_eid, uint8_t se
                         }
                     }
                 }
+                /* One request, one response: done. */
+                return 0;
             }
         }
     }
-
-    return 0;
 }
 
 static int mctp_socket_bind(uint8_t msg_type)
