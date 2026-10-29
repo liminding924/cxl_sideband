@@ -74,6 +74,7 @@ static void setup_signals(void)
 #define TCP_FRAME_HDR_LEN   2
 #define TCP_RECONNECT_SEC   1
 #define TCP_CONNECT_TIMEOUT_MS 3000
+#define TCP_USER_TIMEOUT_MS 3000
 
 struct udp_config {
     bool enabled;
@@ -275,8 +276,15 @@ static int peer_connect(struct udp_config *cfg)
 
         if (cfg->tcp) {
             int one = 1;
+            /* A peer that restarts behind a firewall that drops instead of
+             * resetting leaves a half-open link: sends "succeed" while data
+             * piles up unacked for the ~15 min of default retransmits. Give
+             * up after TCP_USER_TIMEOUT_MS so the reconnect logic kicks in. */
+            unsigned int user_timeout = TCP_USER_TIMEOUT_MS;
             setsockopt(sockfd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
             setsockopt(sockfd, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof(one));
+            setsockopt(sockfd, IPPROTO_TCP, TCP_USER_TIMEOUT, &user_timeout,
+                       sizeof(user_timeout));
             ret = connect_with_timeout(sockfd, rp->ai_addr, rp->ai_addrlen,
                                        TCP_CONNECT_TIMEOUT_MS);
         } else {
